@@ -161,7 +161,7 @@ class MultiNet:
                 print('Unknown loss: {}. Aborting.'.format(loss))
                 exit(1)
 
-        model.compile(optimizer=keras.optimizers.Adam(lr=self.NN_parameters['learning_rate']),
+        model.compile(optimizer=keras.optimizer_v2.adam.Adam(lr=self.NN_parameters['learning_rate']),
                       loss=loss)
 
         return model
