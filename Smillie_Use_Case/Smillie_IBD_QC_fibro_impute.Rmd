@@ -1,0 +1,473 @@
+
+
+```{r}
+##Import libraries
+library('Matrix')
+library('dplyr')
+library(SeuratObject)
+library('Seurat')
+library('reshape2')
+library('ggplot2')
+library('cowplot')
+library(Seurat)
+library(tidyverse)
+library(GEOquery)
+library(stringr)
+library(filesstrings)
+library(harmony)
+library(symphony)
+set.seed(1)
+```
+
+```{r}
+setwd("~/IBD/Smillie_IBD")
+suppressPackageStartupMessages({
+  source('libs.R') # imports
+  source('utils.R') # useful functions and plotting color definitions
+})
+```
+
+```{r}
+#This file outlines the import of each dataset from raw data to QC temp_qc_file 
+##Since AWS can't handle zipped and gzipped files, we have to download it using GEOdataset manually
+#set options and load classifier data
+PercentageMito <- 25
+counts_cutoff <- c(-2.5, 2.5)
+features_cutoff <- c(-5, 5)
+
+#raw_data <- Read10X(data.dir = "~/IBD/Smillie_IBD", gene.column=1)
+#raw_data <- read.csv(file="~/CCI/cellphoneDB/smillie_ibd/smillie_fibs_raw_counts.tsv", sep='\t', header = TRUE, row.names = 1) %>% as("dgCMatrix")
+imputed_data <- read.csv(file="~/CCI/cellphoneDB/smillie_ibd/smillie_fibs_raw_counts_imputed.tsv", sep='\t', header = TRUE, check.names = FALSE, row.names = 1) %>% t(.) %>% as("dgCMatrix")
+meta <- read.csv('~/IBD/Smillie_IBD/all.meta2.txt', sep = "\t", header = TRUE, row.names = 1) 
+meta <- meta[-1,]
+
+temp_qc_file=CreateSeuratObject(counts=imputed_data, meta.data = meta, min.cells = 0, min.features = 0, names.field = 1)
+
+# Start QC
+# identify mitochonrial contamination
+temp_qc_file[['percent.mito']] <- PercentageFeatureSet(temp_qc_file, pattern = "^MT[^0-9a-zA-Z]+")
+
+# Filter non-fibroblasts cells
+#filter_cells=c("Endothelial","Glia", "Pericytes", "Microvascular", "Post-capillary Venules")
+#`%notin%` <- Negate(`%in%`)
+#temp_qc_file <- subset(temp_qc_file, subset = (Cluster %notin% filter_cells))
+table(temp_qc_file@meta.data$Cluster)
+
+#remove empty cells
+initial_cell_number=ncol(temp_qc_file)
+non_empty_cells=row.names(subset(temp_qc_file@meta.data, nCount_RNA>0))
+temp_qc_file <- temp_qc_file[, non_empty_cells]
+
+temp_qc_file[['RNA_feature_logs']] <- scale(log10(temp_qc_file$nFeature_RNA))
+temp_qc_file[['RNA_count_logs']] <- scale(log10(temp_qc_file$nCount_RNA))
+log_counts_features_matrix_cutoffs <- temp_qc_file@meta.data %>% 
+  summarise(nFeature_RNA_low = max(nFeature_RNA[RNA_feature_logs < counts_cutoff[1]]),
+            nFeature_RNA_high = min(nFeature_RNA[RNA_feature_logs > counts_cutoff[2]]),
+            nCount_RNA_low = max(nCount_RNA[RNA_count_logs < counts_cutoff[1]]),
+            nCount_RNA_high = min(nCount_RNA[RNA_count_logs > counts_cutoff[2]]))
+
+##Relationship of genes and counts to identify outliers
+mod <- loess(log10(nFeature_RNA) ~ log10(nCount_RNA), data = temp_qc_file@meta.data)
+temp_qc_file[['nFeature_outlier']] <- scale(mod$residuals) < features_cutoff[1] | scale(mod$residuals) > features_cutoff[2]
+
+Cells_to_keep <- WhichCells(object = temp_qc_file, 
+                            expression = percent.mito <= PercentageMito & 
+                              RNA_feature_logs >= counts_cutoff[1] & 
+                              RNA_feature_logs <= counts_cutoff[2] &
+                              RNA_count_logs >= counts_cutoff[1] & 
+                              RNA_count_logs <= counts_cutoff[2] &
+                              nFeature_outlier == FALSE  )
+
+```
+
+#plots for QC report 
+```{r echo=FALSE, include=TRUE, fig.height=5, fig.width=10}
+
+PercentageMito <- 25
+counts_cutoff <- c(-2.5, 2.5)
+features_cutoff <- c(-5, 5)
+i = 'Smillie_IBD'
+
+p1 <- ggplot(data = temp_qc_file@meta.data, aes(temp_qc_file$percent.mito)) +geom_histogram(binwidth = 1) + geom_vline(xintercept = c(-Inf, PercentageMito), color = 'red') + xlab('Mitochondrial reads in %')
+p2 <- ggplot(data = temp_qc_file@meta.data, aes(temp_qc_file$nFeature_RNA)) +geom_histogram(binwidth = 30) + geom_vline(xintercept = as.numeric(log_counts_features_matrix_cutoffs[1, 1:2]), color = 'red') + xlab('Genes detected')
+p3 <- ggplot(data = temp_qc_file@meta.data, aes(temp_qc_file$nCount_RNA)) +geom_histogram(binwidth = 50) + geom_vline(xintercept = as.numeric(log_counts_features_matrix_cutoffs[1, 3:4]), color = 'red') + xlab('Transcripts Detected')
+p4 <- ggplot(data = temp_qc_file@meta.data, aes(log10(nCount_RNA), log10(nFeature_RNA), color = nFeature_outlier)) + 
+  geom_point(size = 0.5) + scale_color_manual(values = c('grey35', 'red'), guide = FALSE) +
+  xlab('Transcripts [log10]') + ylab('Genes [log10]')
+
+print(
+  plot_grid(p1, p2, p3, p4) + ggtitle(sprintf('QC for sample %s\n Keeping %d of %d cells (%1.2f %%)', 
+                                              #  plot_grid(p1, p2, p3, p4) + ggtitle(sprintf('QC for sample %s\n Keeping %d of %d cells (%1.2f %%)', 
+                                              i, length(Cells_to_keep), initial_cell_number, 
+                                              length(Cells_to_keep)/initial_cell_number*100)) + theme(
+                                                plot.title = element_text(color="black", size=14, face="bold.italic"),
+                                                axis.title.x = element_text(color="blue", size=14, face="bold"),
+                                                axis.title.y = element_text(color="#993333", size=14, face="bold"))
+)
+```
+
+```{r}
+temp_qc_file <- NormalizeData(temp_qc_file) %>% FindVariableFeatures() %>% ScaleData()
+temp_qc_file <- RunPCA(temp_qc_file, features = VariableFeatures(object = temp_qc_file), npcs = 50)
+```
+
+```{r echo=FALSE, include=TRUE, fig.height=5, fig.width=10}
+
+VizDimLoadings(temp_qc_file, dims = 1:2, reduction = "pca")
+ElbowPlot(temp_qc_file, ndims = 50, reduction = "pca")
+```
+
+###
+
+#Run Harmony with PCA embeddings 
+```{r}
+temp_qc_file <- RunHarmony(object = temp_qc_file, assay.use = "RNA", reduction = "pca", dims.use = 1:50, group.by.vars = c("Sample","Subject")) 
+temp_qc_file <- RunUMAP(object = temp_qc_file, assay = "RNA", reduction = "harmony", dims = 1:50, seed.use = 1)
+temp_qc_file <- FindNeighbors(object = temp_qc_file, assay = "RNA", reduction = "harmony", dims = 1:50)
+```
+
+```{r}
+Idents(temp_qc_file) <- "Health"
+DimPlot(temp_qc_file, reduction = "pca", split.by = 'Subject')+ theme(axis.text.x = element_text(angle = 90))
+DimPlot(temp_qc_file, reduction = "harmony", split.by = 'Subject') + theme(axis.text.x = element_text(angle = 90))
+saveRDS(temp_qc_file, file='smillie_temp_qc_file_imputed.rds')
+```
+
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=20}
+VlnPlot(temp_qc_file, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), 
+        split.by = 'Subject',  ncol =3)
+```
+
+
+```{r}
+## Raw data not-imputed data
+smillie_qc_file<-readRDS(file='/mnt/rstudio/smohammed/CNA/smillie/Smillie_CNA_fibroblasts_cells.RDS')
+````
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=15/2}
+p1<-DimPlot(smillie_qc_file,reduction = "umap",label=TRUE,group.by='Cluster', seed = 1) + labs(title = "Raw") 
+p2<-DimPlot(temp_qc_file, reduction = "umap",label=TRUE,group.by='Cluster', seed = 1) + labs(title = "Imputed") 
+p3<-DimPlot(smillie_qc_file,reduction = "umap",label=TRUE,group.by='seurat_clusters', seed = 1)
+p4<-DimPlot(temp_qc_file, reduction = "umap",label=TRUE,group.by='seurat_clusters', seed = 1) 
+
+cowplot::plot_grid(p1+p2+p3+p4)
+```
+
+```{r}
+# different cluster resolution parameter
+Human_CAF_markers <- read.csv('~/Fibroblast_Gene_list_for_Visium.csv', header = TRUE)
+Human_myCAFs <- as.character(Human_CAF_markers$myCAF[Human_CAF_markers$myCAF != ""])
+Human_iCAFs <- as.character(Human_CAF_markers$iCAF[Human_CAF_markers$iCAF != ""])
+Human_apCAF <- c('CD74','HLA-DRA')
+Human_M202 <- c(as.character(Human_CAF_markers$M202[Human_CAF_markers$M202 != ""]),'IL6','IL6R')
+CAF.S1_Markers <- as.character(Human_CAF_markers$CAF.S1_Markers[Human_CAF_markers$CAF.S1_Markers != ""])
+Cluster_Gating_Markers <- as.character(Human_CAF_markers$Cluster_Gating_Markers[Human_CAF_markers$Cluster_Gating_Markers != ""])
+Cluster_Markers <- as.character(Human_CAF_markers$Cluster_Markers[Human_CAF_markers$Cluster_Markers != ""])
+
+Author.iCAFs<-c('CCL11', 'CXCL12', 'FOXL1', 'BMP4','WNT2B', 'WNT5A', 'WNT5B','DKK3', 'WNT2','IL24','IL13RA2','IL11','FAP')
+```
+
+
+```{r}
+## cluster resolutions iterations and associated cluster marker identifications
+cluster_res=c('0.25')
+for (i in cluster_res) { 
+  temp_qc_file <- FindClusters(object = temp_qc_file, resolution = as.numeric(i), random.seed = 1)
+  #temp_qc_file.markers <- FindAllMarkers(temp_qc_file,only.pos =TRUE,min.pct =0.25,logfc.threshold =0.25, random.seed = 1)
+}
+```
+
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=10/2, fig.width=15/2}
+P1<-DotPlot(temp_qc_file, group.by='seurat_clusters', features = Human_myCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "myCAF markers") + theme_linedraw() + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "myCAF markers")
+P2<-DotPlot(temp_qc_file, group.by='seurat_clusters', features = Human_iCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "iCAF markers") + theme_linedraw()
+P3<-DotPlot(temp_qc_file, group.by='seurat_clusters', features = Human_apCAF) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "apCAF markers") + theme_linedraw()
+P4<-DotPlot(temp_qc_file, group.by='seurat_clusters', features = Author.iCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "Author.iCAFs") + theme_linedraw()
+
+P5<-temp_qc_file@meta.data %>% group_by(seurat_clusters) %>% 
+  dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>%
+  ggplot(aes(x = seurat_clusters, y = Freq)) + geom_bar(stat = "identity", fill="grey") + coord_flip() + scale_y_reverse() +
+  geom_text(aes(label=Freq), vjust=0.5, color="black", size=3) + ylab("Number of cells") +  labs(title = paste0("cluster cells - res-", cluster_res)) + theme_minimal_grid()
+
+P6<-temp_qc_file@meta.data %>% group_by(seurat_clusters,Health) %>% dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>%
+    ggplot(aes(x = seurat_clusters, y = Freq, fill= Health)) + geom_bar(position="fill", stat="identity") + theme_minimal_grid()
+
+P7<-temp_qc_file@meta.data %>% group_by(seurat_clusters, Health, Subject) %>% dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>% ggplot(aes(x = seurat_clusters, y = Freq, fill= Subject)) + geom_bar(position="fill", stat="identity") + theme_minimal_grid()
+
+cowplot::plot_grid(P5+P6+P7+P4+P2+P1)
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=10/2, fig.width=15/2}
+
+P1<-DotPlot(smillie_qc_file, group.by='seurat_clusters', features = Human_myCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "myCAF markers") + theme_linedraw() + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "myCAF markers")
+P2<-DotPlot(smillie_qc_file, group.by='seurat_clusters', features = Human_iCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "iCAF markers") + theme_linedraw()
+P3<-DotPlot(smillie_qc_file, group.by='seurat_clusters', features = Human_apCAF) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "apCAF markers") + theme_linedraw()
+P4<-DotPlot(smillie_qc_file, group.by='seurat_clusters', features = Author.iCAFs) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "Author.iCAFs") + theme_linedraw()
+
+P5<-smillie_qc_file@meta.data %>% group_by(seurat_clusters) %>% 
+  dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>%
+  ggplot(aes(x = seurat_clusters, y = Freq)) + geom_bar(stat = "identity", fill="grey") + coord_flip() + scale_y_reverse() +
+  geom_text(aes(label=Freq), vjust=0.5, color="black", size=3) + ylab("Number of cells") +  labs(title = paste0("cluster cells - res-", cluster_res)) + theme_minimal_grid()
+
+P6<-smillie_qc_file@meta.data %>% group_by(seurat_clusters,Health) %>% dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>%
+    ggplot(aes(x = seurat_clusters, y = Freq, fill= Health)) + geom_bar(position="fill", stat="identity") + theme_minimal_grid()
+
+P7<-smillie_qc_file@meta.data %>% group_by(seurat_clusters, Health, Subject) %>% dplyr::summarize(Freq = table(seurat_clusters)) %>% filter_at(vars(starts_with("Freq")), all_vars(. != 0)) %>% ggplot(aes(x = seurat_clusters, y = Freq, fill= Subject)) + geom_bar(position="fill", stat="identity") + theme_minimal_grid()
+
+cowplot::plot_grid(P5+P6+P7+P4+P2+P1)
+```
+
+
+
+```{r M202_markergenes, echo=FALSE, include=TRUE, fig.height=10, fig.width=10}
+FeaturePlot(object = smillie_qc_file, features = Author.iCAFs, reduction = 'umap') 
+FeaturePlot(object = temp_qc_file, features = Author.iCAFs, reduction = 'umap')
+```
+```{r M202_markergenes, echo=FALSE, include=TRUE, fig.height=2.5, fig.width=5}
+p1<-DotPlot(smillie_qc_file, group.by='seurat_clusters', features = Human_M202) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "Raw M202") + theme_linedraw()
+
+p2<-DotPlot(temp_qc_file, group.by='seurat_clusters', features = Human_M202) + scale_x_discrete(guide = guide_axis(angle = 90)) + labs(title = "Imputed M202") + theme_linedraw()
+cowplot::plot_grid(p1+p2)
+```
+
+```{r}
+require("clusterProfiler")
+require("AnnotationDbi")
+require("org.Hs.eg.db")
+require(enrichplot)
+
+make_entrez_ids<-function(df_genes){
+  
+  fibroblast_df <- bind_rows(df_genes) %>% distinct(gene=rownames(df_genes), .keep_all = TRUE)
+  
+  fibroblast_genelist <- mutate(fibroblast_df, entrez=mapIds(org.Hs.eg.db, fibroblast_df$gene, 'ENTREZID', 'SYMBOL')) %>% 
+    dplyr::select(entrez,avg_log2FC) %>%  arrange(desc(avg_log2FC))
+  
+  genelist <- sort(unlist(split(fibroblast_genelist$avg_log2FC,fibroblast_genelist$entrez)), decreasing =TRUE)
+  
+  return(genelist)
+}
+
+make_cluster_entrez_ids<-function(df_genes) {
+    
+  rownames(df_genes)<-NULL
+  cluster_genelist <- mutate(df_genes, entrez=mapIds(org.Hs.eg.db, df_genes$gene, 'ENTREZID', 'SYMBOL'))   %>% dplyr::select(entrez, cluster) %>% drop_na() %>% group_by(cluster) %>% 
+  group_split(.keep=FALSE)
+  
+  cluster_genelist <- lapply(cluster_genelist, as.matrix.Vector)
+  names(cluster_genelist)<-sprintf("C%i",0:(length(cluster_genelist)-1))
+  
+  return(cluster_genelist)
+}
+
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=5}
+
+library(msigdbr)
+msigdbr_show_species()
+m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+head(m_t2g)
+
+cluster_genelist <- make_cluster_entrez_ids(temp_qc_file.markers)
+ck <- compareCluster(cluster_genelist  , 
+                    fun = "enricher", TERM2GENE=m_t2g)
+ 
+print(dotplot(ck, showCategory=30) + ggtitle(paste0("gsea-cluster- ", cluster_res," - ORA")) + scale_colour_gradient2(low = "blue", mid = "blue", high = "red"))
+
+```
+#save object
+```{r}
+saveRDS(temp_qc_file, file='./subcluster/Smillie_IBD_fibroblasts_cells.RDS')
+```
+
+
+# Normalized data is used to build reference map 
+```{r}
+ref_exp_full <- temp_qc_file[['RNA']]@data
+ref_metadata <- temp_qc_file@meta.data
+```
+
+# It is important to generate vargenes_means_sds (containing variable gene means and standard deviations used to scale the genes) as well as save the loadings for the PCA step.
+#Select variable genes and subset reference expression by variable genes
+```{r}
+var_genes = vargenes_vst(ref_exp_full, groups = as.character(ref_metadata[['Subject']]), topn = 2000)
+ref_exp = ref_exp_full[var_genes, ]
+dim(ref_exp)
+```
+
+#Calculate and save the mean and standard deviations for each gene
+```{r}
+vargenes_means_sds = tibble(symbol = var_genes, mean = Matrix::rowMeans(ref_exp))
+vargenes_means_sds$stddev = singlecellmethods::rowSDs(ref_exp, vargenes_means_sds$mean)
+head(vargenes_means_sds)
+```
+
+#Scale data using calculated gene means and standard deviations
+```{r}
+ref_exp_scaled = singlecellmethods::scaleDataWithStats(ref_exp, vargenes_means_sds$mean, vargenes_means_sds$stddev, 1)
+
+s = irlba(ref_exp_scaled, nv = 20)
+Z_pca_ref = diag(s$d) %*% t(s$v) # [pcs by cells]
+loadings = s$u
+```
+
+# Reference harmony object
+```{r}
+ref_harmObj = harmony::HarmonyMatrix(
+  data_mat = t(Z_pca_ref),  ## PCA embedding matrix of cells
+  meta_data = ref_metadata, ## dataframe with cell labels
+  theta = c(1,1),           ## cluster diversity enforcement
+  vars_use = c('Subject','Health'),    ## variable to integrate out
+  nclust = 100,             ## number of clusters in Harmony model
+  max.iter.harmony = 20,
+  return_object = TRUE,     ## return the full Harmony model object
+  do_pca = FALSE            ## don't recompute PCs
+)
+```
+
+# To run the next function buildReferenceFromHarmonyObj(), 
+# you need to input the saved gene loadings (loadings) and vargenes_means_sds.
+# Compress a Harmony object into a Symphony reference
+# Reference harmony object
+```{r}
+reference = symphony::buildReferenceFromHarmonyObj(
+  ref_harmObj,            # output object from HarmonyMatrix()
+  ref_metadata,           # reference cell metadata
+  vargenes_means_sds,     # gene names, means, and std devs for scaling
+  loadings,               # genes x PCs matrix
+  verbose = TRUE,         # verbose output
+  do_umap = TRUE,         # Set to TRUE only when UMAP model was saved for reference
+  save_uwot_path = './testing_uwot_model_1')
+```
+
+#Save Symphony reference (modify with your desired output path)
+```{r}
+saveRDS(reference, './testing_reference1.rds')
+str(reference)
+umap_labels = cbind(ref_metadata, reference$umap$embedding)
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=8}
+
+plotBasic(umap_labels, title = 'Reference - Smillie', color.by = 'Cluster')
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=8}
+
+plotBasic(umap_labels, title = 'Reference - Smillie', color.by = 'seurat_clusters')
+```
+################################################################
+# Symphony reference query mappings
+```{r}
+reference<-readRDS('/mnt/rstudio/smohammed/IBD/Smillie_IBD/testing_reference1.rds')
+kinchen_query<-readRDS('/mnt/rstudio/smohammed/IBD/Kinchen_IBD/Kinchen_IBD_all_cells.RDS')
+
+query_exp<-kinchen_query[["RNA"]]@data
+query_metadata <- kinchen_query@meta.data
+```
+
+# Map query
+```{r}
+query = mapQuery(query_exp,             # query gene expression (genes x cells)
+                 query_metadata,        # query metadata (cells x attributes)
+                 reference,             # Symphony reference object
+                 do_normalize = TRUE,      # perform log(CP10k) normalization on query
+                 do_umap = TRUE) 
+
+```
+
+
+# Predict cell clusters or cell labels 
+```{r}
+predict_celltypes <- function(reference_label) {
+  
+  reference_label<- paste0("reference$meta_data$",reference_label)
+  
+  query = knnPredict(query, reference, eval(parse(text=reference_label)), k = 5)
+
+  head(query$meta_data)
+  head(reference$meta_data)
+
+  # Sync the column names for both data frames
+  reference$meta_data$cell_type_pred_knn = NA
+  reference$meta_data$ref_query = 'reference'
+  query$meta_data$ref_query = 'query'
+
+  # Add the UMAP coordinates to the metadata
+  meta_data_combined = bind_rows(query$meta_data, reference$meta_data)
+  umap_combined = rbind(query$umap, reference$umap$embedding)
+  umap_combined_labels = cbind(meta_data_combined, umap_combined)
+  
+  return(umap_combined_labels)
+}
+```
+
+```{r}
+umap_combined_labels_clusters<-predict_celltypes(reference_label="seurat_clusters")
+umap_combined_labels_celltypes<-predict_celltypes(reference_label="Cluster")
+```
+
+
+
+# Plot UMAP visualization of all cells
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=5, fig.width=8}
+plotBasic(umap_combined_labels_clusters, title = 'Reference and query cells', color.by = 'ref_query')
+plotBasic(umap_combined_labels_celltypes, title = 'Reference and query cells', color.by = 'ref_query')
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=4, fig.width=12}
+p1<-plotBasic(umap_combined_labels_clusters, title = 'Smillie - Reference cells', 
+          color.by = 'seurat_clusters')
+p2<-plotBasic(umap_combined_labels_clusters, title = ' Kinchen - query cells', 
+              color.by = 'cell_type_pred_knn')
+plot_grid(p1+p2)
+```
+
+```{r Plot1, echo=FALSE, include=TRUE, fig.height=4, fig.width=12}
+p1<-plotBasic(umap_combined_labels_celltypes, title = 'Smillie - Reference cells', 
+          color.by = 'Cluster')
+p2<-plotBasic(umap_combined_labels_celltypes, title = ' Kinchen - query cells', 
+              color.by = 'cell_type_pred_knn')
+plot_grid(p1+p2)
+```
+
+```{r}
+save(umap_combined_labels_clusters,umap_combined_labels_celltypes, file="../Kinchen_IBD/differential/kinchen_labels_clusters.rda")
+```
+
+##########################################
+# Find differentially expressed features between cluster 2 and all other fibroblasts cells
+# DE using Wilcoxon Rank Sum test
+```{r}
+smillie_wilcox_markers <- FindMarkers(temp_qc_file, ident.1 = "2", ident.2 = NULL, only.pos = FALSE, random.seed = 1, test.use = "wilcox", logfc.threshold = 0.25, min.pct = 0.25)
+dim(smillie_wilcox_markers)
+```
+
+# DE using DESeq2 using maximum cell per indent 
+```{r}
+smillie_deseq2_markers <- FindMarkers(temp_qc_file, ident.1 = "2", ident.2 = NULL, only.pos = FALSE, random.seed = 1, test.use = "DESeq2", max.cells.per.ident = 100, logfc.threshold = 0.25, min.pct = 0.25)
+dim(smillie_deseq2_markers)
+```
+
+
+#common
+```{r}
+make_venn_stats<-function (df1,df2) {
+  com<-length(intersect(rownames(df1),rownames(df2)))
+  uniq1<-length(setdiff(rownames(df1),rownames(df2)))
+  uniq2<-length(setdiff(rownames(df2),rownames(df1)))
+  print(c(uniq1,com,uniq2))
+}
+  
+make_venn_stats(smillie_wilcox_markers, smillie_wilcox_subject)
+make_venn_stats(smillie_deseq2_markers, smillie_deseq2_subject)
+
+smillie_wilcox_markers %>% dim()
+smillie_deseq2_markers %>% dim()
+
+smillie_wilcox_markers %>% top_n(n = 10, wt = avg_log2FC)
+smillie_deseq2_markers %>% top_n(n = 10, wt = avg_log2FC)
+```
